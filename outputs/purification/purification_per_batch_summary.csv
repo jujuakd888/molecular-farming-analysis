@@ -1,0 +1,6 @@
+batch_id,start_mass_mg,final_mass_mg,final_volume_ml,final_concentration_mg_ml,overall_yield_pct,n_steps
+B1,95.86,48.68,93,0.523,50.8,5
+B2,109.07,57.66,83.9,0.687,52.9,5
+B3,139.19,72.85,88.81,0.82,52.3,5
+B4,110.19,55.69,85.24,0.653,50.5,5
+B5,119.7,63.16,79.89,0.791,52.8,5
