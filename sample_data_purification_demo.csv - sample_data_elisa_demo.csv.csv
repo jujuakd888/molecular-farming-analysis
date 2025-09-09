@@ -1,0 +1,6 @@
+"Step,Volume_mL,Conc_mg_per_mL,Yield_mg,Note"
+"Crude_Extract,100,0.50,50,post-extraction"
+"Clarified,80,0.45,36,after clarification"
+"Affinity,10,2.00,20,Ni-NTA elution"
+"Polishing,5,3.00,15,SEC"
+"Final,2,5.00,10,formulated"
