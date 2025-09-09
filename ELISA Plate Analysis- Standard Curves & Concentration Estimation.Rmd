@@ -1,0 +1,264 @@
+---
+title: "ELISA Plate Analysis: Standard Curves & Concentration Estimation"
+author: "Jude Akkad"
+date: "2025-09-09"
+output: html_document
+---
+
+```{r}
+# Load required packages
+pkgs <- c("tibble", "dplyr", "readr")
+to_install <- pkgs[!pkgs %in% installed.packages()[,"Package"]]
+if (length(to_install)) install.packages(to_install, quiet = TRUE)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Function to simulate ELISA plate data
+simulate_elisa_plate <- function(
+  standards = c(0.1, 0.5, 1, 5, 10, 50, 100),
+  n_reps = 3,
+  n_unknowns = 5,
+  true_params = list(b = 1.2, c = 0.05, d = 2.0, e = 5),
+  noise_sd = 0.05
+) {
+  fourPL <- function(x, b, c, d, e) {
+    c + (d - c) / (1 + (x / e)^b)
+  }
+  std_data <- do.call(rbind, lapply(standards, function(conc) {
+    tibble(
+      Sample = paste0("Std-", conc),
+      Conc   = conc,
+      OD     = fourPL(conc, !!!true_params) + rnorm(n_reps, 0, noise_sd)
+    )
+  }))
+  unk_concs <- runif(n_unknowns, min(0.2), max(80))
+  unk_data <- do.call(rbind, lapply(seq_along(unk_concs), function(i) {
+    conc <- unk_concs[i]
+    tibble(
+      Sample = paste0("Unknown-", i),
+      Conc   = NA_real_,
+      OD     = fourPL(conc, !!!true_params) + rnorm(n_reps, 0, noise_sd)
+    )
+  }))
+  bind_rows(std_data, unk_data)
+}
+
+# Generate fake dataset
+fake_elisa <- simulate_elisa_plate()
+
+# Save to CSV in your project folder
+outdir <- "~/Desktop/Github/Molecular Farming/sample_data"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+outfile <- file.path(outdir, "sample_data_elisa_demo.csv")
+write_csv(fake_elisa, outfile)
+
+# Confirmation message
+message("Fake ELISA data written to: ", outfile)
+
+```
+```{r}
+# ---- More packages ----
+pkgs2 <- c("drc","broom","ggplot2","scales","glue")
+to_install2 <- pkgs2[!pkgs2 %in% installed.packages()[,"Package"]]
+if (length(to_install2)) install.packages(to_install2, quiet = TRUE)
+invisible(lapply(pkgs2, library, character.only = TRUE))
+
+```
+
+
+```{r}
+# ---- Read data ----
+data_path <- "~/Desktop/Github/Molecular Farming/sample_data/sample_data_elisa_demo.csv" #replace this with where your data is 
+elisa <- readr::read_csv(data_path, show_col_types = FALSE)
+standards <- elisa |> dplyr::filter(!is.na(Conc)) |> dplyr::rename(conc_known = Conc, od = OD)
+unknowns  <- elisa |> dplyr::filter(is.na(Conc))  |> dplyr::rename(od = OD)
+
+standards_summary <- standards |>
+  dplyr::group_by(conc_known) |>
+  dplyr::summarise(n = dplyr::n(), mean_od = mean(od), sd_od = sd(od), .groups = "drop")
+
+```
+```{r}
+# ---- Fit 4PL ----
+# Clean: keep finite values only
+std_clean <- standards |>
+  dplyr::filter(is.finite(conc_known), is.finite(od))
+
+# Replace 0 / negative concentrations with a tiny positive epsilon (1/10 of the smallest positive std)
+if (any(std_clean$conc_known <= 0, na.rm = TRUE)) {
+  min_pos <- min(std_clean$conc_known[std_clean$conc_known > 0], na.rm = TRUE)
+  eps <- min_pos / 10
+  std_clean <- std_clean |>
+    dplyr::mutate(conc_known = ifelse(conc_known <= 0, eps, conc_known))
+}
+
+# Good starting values help avoid NaNs during optimization
+start_vals <- c(
+  b = 1.0,
+  c = min(std_clean$od, na.rm = TRUE),
+  d = max(std_clean$od, na.rm = TRUE),
+  e = exp(mean(log(std_clean$conc_known), na.rm = TRUE)) # geometric center
+)
+
+fit_try <- try(
+  drc::drm(od ~ conc_known, data = std_clean,
+           fct = drc::LL.4(names = c("b","c","d","e")),
+           start = start_vals,
+           control = drc::drmc(errorm = FALSE, maxIt = 200)),
+  silent = TRUE
+)
+
+# Fallback to 5PL if 4PL fails
+if (inherits(fit_try, "try-error")) {
+  fit_try <- drc::drm(od ~ conc_known, data = std_clean,
+                      fct = drc::LL.5(names = c("b","c","d","e","f")),
+                      control = drc::drmc(errorm = FALSE, maxIt = 300))
+  message("Note: 4PL failed; used 5PL fallback.")
+}
+
+fit <- fit_try
+fit_tidy <- broom::tidy(fit)
+
+# Back-calc & QC on standards
+backcalc <- std_clean |>
+  dplyr::mutate(pred_od = predict(fit, newdata = data.frame(conc_known = conc_known)))
+
+inv_predict_single <- function(od_val) {
+  # Clamp OD to the model's prediction range to avoid ED() NaNs
+  pred_grid <- data.frame(conc_known = exp(seq(log(min(std_clean$conc_known)), log(max(std_clean$conc_known)), length.out = 200)))
+  pred_vals <- as.numeric(predict(fit, newdata = pred_grid))
+  lo <- min(pred_vals, na.rm = TRUE); hi <- max(pred_vals, na.rm = TRUE)
+  od_val <- min(max(od_val, lo + .Machine$double.eps), hi - .Machine$double.eps)
+  est <- try(drc::ED(fit, respLev = od_val, type = "absolute", display = FALSE)[,1], silent = TRUE)
+  if (inherits(est, "try-error")) NA_real_ else as.numeric(est)
+}
+
+backcalc$conc_hat <- vapply(backcalc$od, inv_predict_single, numeric(1))
+backcalc <- backcalc |>
+  dplyr::mutate(bias_pct = (conc_hat - conc_known) / conc_known * 100)
+
+qc_summary <- backcalc |>
+  dplyr::group_by(conc_known) |>
+  dplyr::summarise(
+    mean_bias_pct = mean(bias_pct, na.rm = TRUE),
+    sd_bias_pct   = sd(bias_pct, na.rm = TRUE),
+    rmse_od       = sqrt(mean((od - pred_od)^2, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+lloq <- min(std_clean$conc_known, na.rm = TRUE)
+uloq <- max(std_clean$conc_known, na.rm = TRUE)
+
+```
+
+
+```{r}
+# ---- Interpolate unknowns ----
+inv_predict_many <- function(od_vec) {
+  pred_grid <- data.frame(conc_known = exp(seq(log(lloq), log(uloq), length.out = 200)))
+  pred_vals <- as.numeric(predict(fit, newdata = pred_grid))
+  lo <- min(pred_vals, na.rm = TRUE); hi <- max(pred_vals, na.rm = TRUE)
+  vapply(od_vec, function(v) {
+    v <- min(max(v, lo + .Machine$double.eps), hi - .Machine$double.eps)
+    est <- try(drc::ED(fit, respLev = v, type = "absolute", display = FALSE)[,1], silent = TRUE)
+    if (inherits(est, "try-error")) NA_real_ else as.numeric(est)
+  }, numeric(1))
+}
+
+
+```
+
+
+```{r}
+# ---- Plots ----
+curve_grid <- tibble::tibble(conc = exp(seq(log(max(lloq, .Machine$double.eps)), log(uloq), length.out = 200))) |>
+  dplyr::mutate(pred = predict(fit, newdata = data.frame(conc_known = conc)))
+
+p_curve <- ggplot2::ggplot(standards, ggplot2::aes(conc_known, od)) +
+  ggplot2::geom_point(size = 2, alpha = 0.85) +
+  ggplot2::geom_line(data = curve_grid, ggplot2::aes(conc, pred)) +
+  ggplot2::scale_x_log10(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+  ggplot2::labs(title = "ELISA 4PL Standard Curve", x = "Concentration (ng/mL) [log10]", y = "OD") +
+  ggplot2::annotate("rect", xmin = lloq, xmax = uloq, ymin = -Inf, ymax = Inf, alpha = 0.05) +
+  ggplot2::theme_minimal(base_size = 12)
+
+p_resid <- backcalc |>
+  dplyr::mutate(resid = od - pred_od) |>
+  ggplot2::ggplot(ggplot2::aes(conc_known, resid)) +
+  ggplot2::geom_hline(yintercept = 0, linetype = 2) +
+  ggplot2::geom_point(alpha = 0.85) +
+  ggplot2::scale_x_log10(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+  ggplot2::labs(title = "Residuals on Standards", x = "Concentration (ng/mL) [log10]", y = "Residual (OD)") +
+  ggplot2::theme_minimal(base_size = 12)
+
+print(p_curve)
+print(p_resid)
+
+```
+```{r}
+# ---- SETUP + PATHS (for exports) ----
+# deps for paths + message templating
+pkgs_path <- c("fs","glue")
+to_install_path <- pkgs_path[!pkgs_path %in% installed.packages()[,"Package"]]
+if (length(to_install_path)) install.packages(to_install_path, quiet = TRUE)
+invisible(lapply(pkgs_path, library, character.only = TRUE))
+
+# helper for safe defaults
+`%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
+if (!exists("params")) params <- list()
+
+# If you used a hardcoded data_path above, base the export folder on that.
+# Otherwise, fall back to your Desktop/Github/Gitub paths.
+default_data_dir <- if (exists("data_path")) {
+  fs::path_dir(fs::path_expand(data_path))
+} else if (dir.exists(path.expand("~/Desktop/Github/Molecular Farming/sample_data"))) {
+  "~/Desktop/Github/Molecular Farming/sample_data"
+} else {
+  "~/Desktop/Gitub/Molecular Farming/sample_data"
+}
+
+data_dir <- params$data_dir %||% default_data_dir
+data_dir <- fs::path_expand(data_dir)
+if (!dir.exists(data_dir)) stop("Data directory not found: ", data_dir)
+
+# project root is the parent of sample_data
+project_dir <- fs::path_norm(fs::path(data_dir, ".."))
+
+# save exports into outputs/elisa
+save_dir <- fs::path_norm(fs::path(project_dir, "outputs/elisa"))
+fs::dir_create(save_dir, recurse = TRUE)
+
+message("Data dir: ", data_dir)
+message("Exports -> ", save_dir)
+
+```
+
+```{r}
+# ---- EXPORTS ----
+
+# Tables
+readr::write_csv(elisa,      fs::path(save_dir, "elisa_raw_data.csv"))
+readr::write_csv(backcalc,   fs::path(save_dir, "elisa_backcalculated_standards.csv"))
+readr::write_csv(qc_summary, fs::path(save_dir, "elisa_qc_summary.csv"))
+
+# Plots
+ggplot2::ggsave(fs::path(save_dir, "elisa_standard_curve.png"),
+                p_curve, width = 7, height = 5, dpi = 300)
+ggplot2::ggsave(fs::path(save_dir, "elisa_residuals.png"),
+                p_resid, width = 7, height = 5, dpi = 300)
+
+# Confirmation message
+cat(glue::glue("
+**Files written to** `{save_dir}`
+
+- elisa_raw_data.csv
+- elisa_backcalculated_standards.csv
+- elisa_qc_summary.csv
+- elisa_standard_curve.png
+- elisa_residuals.png
+"))
+
+```
+

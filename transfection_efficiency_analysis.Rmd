@@ -1,0 +1,500 @@
+---
+title: "transfection_efficiency_analysis"
+author: "Jude Akkad"
+date: "2025-09-09"
+output: html_document
+---
+```{r}
+# ---- Setup (toy, sanitized) ----
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(openxlsx)  # 
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(purrr)
+  library(stringr)
+  library(knitr)   # kable
+  library(forcats)
+})
+
+set.seed(42)
+
+# -----------------------------------------------------------------------------
+# Make a tiny TOY workbook on the fly (matches your expected layout)
+# -----------------------------------------------------------------------------
+make_toy_sheet <- function(n_rows = 30, zproj_id = 1) {
+  ch <- function(prefix) {
+    tibble::tibble(
+      !!sym(paste0(prefix, "ZProj"))        := zproj_id,
+      !!sym(paste0(prefix, "mask"))         := sprintf("Image-%04d:%04d-%04d", zproj_id, seq_len(n_rows), sample(10:500, n_rows, TRUE)),
+      !!sym(paste0(prefix, "area"))         := pmax(1, round(rlnorm(n_rows, meanlog = 3.5, sdlog = 0.6), 3)),
+      !!sym(paste0(prefix, "mean"))         := round(rlnorm(n_rows, meanlog = 1.8, sdlog = 0.4), 3),
+      !!sym(paste0(prefix, "circ"))         := round(runif(n_rows, 0.6, 1.0), 3),
+      !!sym(paste0(prefix, "intDen"))       := round(rlnorm(n_rows, meanlog = 8.5, sdlog = 0.7), 3),
+      !!sym(paste0(prefix, "RawintDen"))    := round(rlnorm(n_rows, meanlog = 8.7, sdlog = 0.7), 3),
+      !!sym(paste0(prefix, "AR"))           := round(rlnorm(n_rows, meanlog = 0.2, sdlog = 0.3), 3),
+      !!sym(paste0(prefix, "Round"))        := round(runif(n_rows, 0.7, 1.0), 3),
+      !!sym(paste0(prefix, "Solidarity"))   := round(runif(n_rows, 0.7, 1.0), 3)
+    )
+  }
+
+  gfp <- ch("GFP_")
+  rfp <- ch("RFP_")
+
+  rfp$RFP_intDen <- round(rfp$RFP_intDen * runif(1, 0.7, 1.3), 3)
+  gfp$GFP_circ   <- round(pmin(1, gfp$GFP_circ * runif(1, 0.9, 1.05)), 3)
+
+  dplyr::bind_cols(
+    gfp %>%
+      dplyr::rename(
+        ZProj = GFP_ZProj, GFP_mask = GFP_mask, GFP_area = GFP_area,
+        GFP_mean = GFP_mean, GFP_circ = GFP_circ, GFP_intDen = GFP_intDen,
+        GFP_RawintDen = GFP_RawintDen, GFP_AR = GFP_AR, GFP_Round = GFP_Round,
+        GFP_Solidarity = GFP_Solidarity
+      ),
+    Spacer = NA,  # column K
+    rfp %>%
+      dplyr::rename(
+        ZProj_r = RFP_ZProj, RFP_mask = RFP_mask, RFP_area = RFP_area,
+        RFP_mean = RFP_mean, RFP_circ = RFP_circ, RFP_intDen = RFP_intDen,
+        RFP_RawintDen = RFP_RawintDen, RFP_AR = RFP_AR, RFP_Round = RFP_Round,
+        RFP_Solidarity = RFP_Solidarity
+      )
+  )
+}
+
+toy_sheet_names <- c(
+  "Max Intensity Image 6 Moments",
+  "AVG Intensity Image 6 Yen",
+  "Max Intensity Image 8 Moments+Y",
+  "AVG Intensity Image 9 Moments",
+  "Max Int Image 13 Moments",
+  "Max Int Image 16 Yen",
+  "Max Int Image 18 Moments + Yen"
+)
+
+toy_sheets <- setNames(
+  lapply(seq_along(toy_sheet_names), function(i) make_toy_sheet(n_rows = sample(20:40, 1), zproj_id = i)),
+  toy_sheet_names
+)
+
+# ---- write TOY workbook with openxlsx (no writexl) --------------------------
+wb <- createWorkbook()
+for (nm in names(toy_sheets)) {
+  addWorksheet(wb, nm)
+  writeData(wb, nm, toy_sheets[[nm]])
+}
+file_path <- file.path(tempdir(), "toy_gfprfp.xlsx")
+saveWorkbook(wb, file_path, overwrite = TRUE)
+
+cat("Using TOY workbook:", normalizePath(file_path), "\n")
+
+# ---- Small helpers -----------------------------------------------------------
+std_condition <- function(x) {
+  case_when(
+    str_detect(x, regex("Moment\\s*\\+\\s*Y(en)?", ignore_case = TRUE)) ~ "Moments+Yen",
+    str_detect(x, regex("Moments\\s*\\+\\s*Y(en)?", ignore_case = TRUE)) ~ "Moments+Yen",
+    str_detect(x, regex("\\bMoments\\b",            ignore_case = TRUE)) ~ "Moments",
+    str_detect(x, regex("\\bMoment\\b",             ignore_case = TRUE)) ~ "Moments",
+    str_detect(x, regex("\\bYen\\b",                ignore_case = TRUE)) ~ "Yen",
+    TRUE ~ NA_character_
+  )
+}
+std_type <- function(x) ifelse(str_detect(x, regex("\\bAVG\\b", ignore_case = TRUE)), "AVG", "MAX")
+condition_levels <- c("Moments", "Yen", "Moments+Yen")
+
+# ---- Inspect & select sheets -------------------------------------------------
+stopifnot(file.exists(file_path))
+sheets_in_file   <- excel_sheets(file_path)
+candidate_sheets <- sheets_in_file[grepl("Image\\s*(6|8|9|13|16|18)\\b", sheets_in_file)]
+single_sheets    <- candidate_sheets[grepl("Image\\s*(6|8|9)\\b",  candidate_sheets)]
+double_sheets    <- candidate_sheets[grepl("Image\\s*(13|16|18)\\b", candidate_sheets)]
+
+# ---- Processing function -----------------------------------------------------
+process_sheet <- function(sheet_name, path = file_path) {
+  df <- read_excel(path, sheet = sheet_name)
+
+  image_id  <- stringr::str_match(sheet_name, "Image\\s*(\\d+)")[,2]
+  condition <- std_condition(sheet_name)
+  type      <- std_type(sheet_name)
+  construct <- ifelse(image_id %in% c("13","16","18"), "Double", "Single")
+
+  gfp <- df %>%
+    dplyr::select(1:10) %>%
+    stats::setNames(c("ZProj","GFP_mask","GFP_area","GFP_mean","GFP_circ",
+                      "GFP_intDen","GFP_RawintDen","GFP_AR","GFP_Round","GFP_Solidarity")) %>%
+    dplyr::mutate(RowID = dplyr::row_number()) %>%
+    dplyr::mutate(dplyr::across(c(GFP_area, GFP_circ, GFP_intDen), as.numeric))
+
+  rfp <- df %>%
+    dplyr::select(12:21) %>%
+    stats::setNames(c("ZProj_r","RFP_mask","RFP_area","RFP_mean","RFP_circ",
+                      "RFP_intDen","RFP_RawintDen","RFP_AR","RFP_Round","RFP_Solidarity")) %>%
+    dplyr::mutate(RowID = dplyr::row_number()) %>%
+    dplyr::mutate(dplyr::across(c(RFP_area, RFP_circ, RFP_intDen), as.numeric))
+
+  paired <- gfp %>%
+    dplyr::inner_join(rfp, by = "RowID") %>%
+    dplyr::mutate(
+      image     = image_id,
+      condition = condition,
+      type      = type,
+      construct = construct,
+      nucleus_id = dplyr::if_else(
+        as.character(GFP_mask) == as.character(RFP_mask),
+        as.character(GFP_mask),
+        paste0("GFP:", as.character(GFP_mask), " | RFP:", as.character(RFP_mask))
+      )
+    )
+
+  before_n  <- nrow(paired)
+  gfp_pass  <- with(paired, GFP_area >= 20 & GFP_circ >= 0.80)
+  rfp_pass  <- with(paired, RFP_area >= 20 & RFP_circ >= 0.80)
+  keep_both <- gfp_pass & rfp_pass
+
+  filtered <- paired %>%
+    mutate(gfp_pass = gfp_pass, rfp_pass = rfp_pass, keep = keep_both) %>%
+    filter(keep) %>%
+    mutate(ratio = (GFP_intDen / RFP_intDen) * 100)
+
+  note <- tibble::tibble(
+    sheet       = sheet_name,
+    image       = image_id,
+    condition   = condition,
+    type        = type,
+    construct   = construct,
+    gfp_kept    = sum(gfp_pass, na.rm = TRUE),
+    rfp_kept    = sum(rfp_pass, na.rm = TRUE),
+    paired_kept = sum(keep_both, na.rm = TRUE),
+    total       = before_n,
+    kept_note   = paste0("GFP ", gfp_kept, "/", before_n,
+                         "; RFP ", rfp_kept, "/", before_n,
+                         "; Paired ", paired_kept, "/", before_n, " kept")
+  )
+
+  list(
+    data              = filtered,
+    note              = note,
+    paired_with_flags = paired %>% mutate(gfp_pass = gfp_pass, rfp_pass = rfp_pass, keep = keep_both)
+  )
+}
+
+# ---- Run pipeline ------------------------------------------------------------
+results <- purrr::map(c(single_sheets, double_sheets), ~process_sheet(.x, file_path))
+
+all_data  <- purrr::map_dfr(results, "data") %>%
+  mutate(
+    condition = factor(condition, levels = condition_levels),
+    image     = as.character(image),
+    type      = factor(type, levels = c("AVG","MAX")),
+    construct = factor(construct, levels = c("Single","Double"))
+  )
+
+all_notes <- purrr::map_dfr(results, "note") %>%
+  mutate(
+    condition = factor(condition, levels = condition_levels),
+    image     = as.character(image),
+    type      = factor(type, levels = c("AVG","MAX")),
+    construct = factor(construct, levels = c("Single","Double"))
+  )
+
+all_flags <- purrr::map_dfr(results, "paired_with_flags")
+
+# Save toy outputs (just for demo)
+write.csv(all_data,  "TOY_Filtered_Nuclei_With_Ratios.csv", row.names = FALSE)
+write.csv(all_flags, "TOY_AllRows_With_PassFlags.csv",      row.names = FALSE)
+
+# ---- Summary + quick report --------------------------------------------------
+summary_table <- all_data %>%
+  group_by(image, condition, type, construct) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  arrange(construct, type, condition, image)
+kable(summary_table, caption = "TOY: Number of paired-kept nuclei per condition")
+
+cat("\n\n## TOY Nuclei Filtering Report (separate channel filters)\n\n")
+all_notes %>%
+  arrange(construct, type, condition, image) %>%
+  mutate(report = paste0("**Image ", image, "** (", as.character(construct),
+                         ", ", as.character(type), ", ", as.character(condition),
+                         "): ", kept_note)) %>%
+  pull(report) %>%
+  paste(collapse = "\n\n") %>%
+  cat()
+
+# ---- Debug viewer (first 10 rows) -------------------------------------------
+sheet_debug <- (double_sheets[1] %||% single_sheets[1])
+dbg <- process_sheet(sheet_debug, file_path)
+knitr::kable(
+  dbg$paired_with_flags %>%
+    transmute(RowID, GFP_area, GFP_circ, RFP_area, RFP_circ, gfp_pass, rfp_pass, keep) %>%
+    head(10),
+  caption = paste("TOY: Pass flags for", sheet_debug, "(first 10)")
+)
+
+# ---- Plots (identical logic, toy labels) ------------------------------------
+
+# Single constructs
+if (nrow(all_data %>% filter(construct == "Single")) > 0) {
+  ggplot(
+    all_data %>% dplyr::filter(construct == "Single"),
+    aes(x = GFP_intDen, y = RFP_intDen, color = image, shape = image)
+  ) +
+    geom_point(alpha = 0.7) +
+    facet_grid(type ~ condition) +
+    theme_bw() +
+    labs(
+      title = "TOY — Single Constructs: GFP vs RFP",
+      x = "GFP integrated density",
+      y = "RFP integrated density"
+    )
+}
+
+# Double constructs (MAX only)
+if (nrow(all_data %>% filter(construct == "Double", type == "MAX")) > 0) {
+  ggplot(
+    all_data %>% dplyr::filter(construct == "Double", type == "MAX"),
+    aes(x = GFP_intDen, y = RFP_intDen, color = image, shape = image)
+  ) +
+    geom_point(alpha = 0.7) +
+    facet_wrap(~ condition) +
+    theme_bw() +
+    labs(
+      title = "TOY — Double Constructs: GFP vs RFP (MAX only)",
+      x = "GFP integrated density",
+      y = "RFP integrated density"
+    )
+}
+
+# Combined MAX (Single + Double)
+if (nrow(all_data %>% filter(type == "MAX")) > 0) {
+  ggplot(
+    all_data %>% dplyr::filter(type == "MAX"),
+    aes(x = GFP_intDen, y = RFP_intDen, color = image, shape = construct)
+  ) +
+    geom_point(alpha = 0.7) +
+    facet_wrap(~ condition) +
+    theme_bw() +
+    labs(
+      title = "TOY — MAX Intensity: GFP vs RFP (Single + Double)",
+      x = "GFP integrated density",
+      y = "RFP integrated density"
+    )
+}
+
+```
+```{r}
+# ---- Diagnostics (TOY version) ----------------------------------------------
+
+if (exists("all_flags") && nrow(all_flags) > 0) {
+  
+  diag_summary <- all_flags %>%
+    mutate(
+      fail_reason = case_when(
+        keep ~ "kept",
+        !gfp_pass & !rfp_pass ~ "both fail",
+        !gfp_pass ~ "GFP fail",
+        !rfp_pass ~ "RFP fail",
+        TRUE ~ "unknown"
+      )
+    ) %>%
+    group_by(construct, type, condition, image, fail_reason) %>%
+    summarise(n = n(), .groups = "drop_last") %>%
+    mutate(pct = round(100 * n / sum(n), 1)) %>%
+    ungroup()
+  
+  # table: kept rate per group
+  kept_rate <- diag_summary %>%
+    group_by(construct, type, condition, image) %>%
+    summarise(
+      kept = sum(n[fail_reason == "kept"], na.rm = TRUE),
+      total = sum(n),
+      kept_rate = round(100 * kept / total, 1),
+      .groups = "drop"
+    ) %>%
+    arrange(construct, type, condition, image)
+  
+  knitr::kable(kept_rate, caption = "TOY — Kept rate per group (%)")
+  knitr::kable(diag_summary, caption = "TOY — Failure breakdown per group")
+  
+} else {
+  cat("No diagnostics available (all_flags missing or empty).\n")
+}
+
+```
+```{r}
+# ---- Quick plot: why nuclei were excluded (TOY) -----------------------------
+
+if (exists("all_flags") && nrow(all_flags) > 0) {
+  all_flags %>%
+    mutate(
+      fail_reason = case_when(
+        keep ~ "kept",
+        !gfp_pass & !rfp_pass ~ "both fail",
+        !gfp_pass ~ "GFP fail",
+        !rfp_pass ~ "RFP fail",
+        TRUE ~ "unknown"
+      )
+    ) %>%
+    filter(fail_reason != "kept") %>%
+    count(type, condition, fail_reason) %>%
+    ggplot(aes(x = condition, y = n, fill = fail_reason)) +
+    geom_col(position = "dodge") +
+    facet_wrap(~ type, scales = "free_y") +
+    theme_bw() +
+    labs(
+      title = "TOY — Why nuclei were excluded",
+      x = "Condition",
+      y = "Count",
+      fill = "Reason"
+    )
+} else {
+  cat("No exclusion plot available (all_flags missing or empty).\n")
+}
+
+```
+```{r}
+# ---- QC histograms (TOY) ----------------------------------------------------
+
+if (exists("all_flags") && nrow(all_flags) > 0) {
+  
+  # Area distribution (cutoff = 20)
+  ggplot(all_flags, aes(GFP_area)) +
+    geom_histogram(bins = 30, color = "black", fill = "steelblue") +
+    facet_grid(type ~ condition) +
+    geom_vline(xintercept = 20, color = "red", linetype = "dashed") +
+    labs(
+      title = "TOY — Area distribution by condition/type",
+      x = "GFP_area",
+      y = "Count"
+    ) +
+    theme_bw()
+  
+  # Circularity distribution (cutoff = 0.80)
+  ggplot(all_flags, aes(GFP_circ)) +
+    geom_histogram(bins = 30, color = "black", fill = "darkgreen") +
+    facet_grid(type ~ condition) +
+    geom_vline(xintercept = 0.80, color = "red", linetype = "dashed") +
+    labs(
+      title = "TOY — Circularity distribution by condition/type",
+      x = "GFP_circ",
+      y = "Count"
+    ) +
+    theme_bw()
+  
+} else {
+  cat("No QC histograms available (all_flags missing or empty).\n")
+}
+
+```
+
+```{r}
+# ---- Export bundle -----------------------------------------------------------
+
+# 0) prep output folder & filenames
+run_stamp   <- format(Sys.time(), "%Y%m%d-%H%M%S")
+out_dir     <- file.path(getwd(), paste0("transfection_efficiency_outputs_", run_stamp))
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+xlsx_file   <- file.path(out_dir, "transfection_efficiency_results.xlsx")
+readme_file <- file.path(out_dir, "README.txt")
+
+# 1) (re)build plots as objects so we can save them --------------------------------
+make_plot_single <- function(df) {
+  if (!nrow(df %>% dplyr::filter(construct == "Single"))) return(NULL)
+  ggplot(
+    df %>% dplyr::filter(construct == "Single"),
+    aes(x = GFP_intDen, y = RFP_intDen, color = image, shape = image)
+  ) +
+    geom_point(alpha = 0.7) +
+    facet_grid(type ~ condition) +
+    theme_bw() +
+    labs(
+      title = "TOY — Single Constructs: GFP vs RFP",
+      x = "GFP integrated density", y = "RFP integrated density"
+    )
+}
+
+make_plot_double <- function(df) {
+  if (!nrow(df %>% dplyr::filter(construct == "Double", type == "MAX"))) return(NULL)
+  ggplot(
+    df %>% dplyr::filter(construct == "Double", type == "MAX"),
+    aes(x = GFP_intDen, y = RFP_intDen, color = image, shape = image)
+  ) +
+    geom_point(alpha = 0.7) +
+    facet_wrap(~ condition) +
+    theme_bw() +
+    labs(
+      title = "TOY — Double Constructs: GFP vs RFP (MAX only)",
+      x = "GFP integrated density", y = "RFP integrated density"
+    )
+}
+
+make_plot_maxcombo <- function(df) {
+  if (!nrow(df %>% dplyr::filter(type == "MAX"))) return(NULL)
+  ggplot(
+    df %>% dplyr::filter(type == "MAX"),
+    aes(x = GFP_intDen, y = RFP_intDen, color = image, shape = construct)
+  ) +
+    geom_point(alpha = 0.7) +
+    facet_wrap(~ condition) +
+    theme_bw() +
+    labs(
+      title = "TOY — MAX Intensity: GFP vs RFP (Single + Double)",
+      x = "GFP integrated density", y = "RFP integrated density"
+    )
+}
+
+make_plot_failbars <- function(flags) {
+  if (!exists("all_flags") || !is.data.frame(flags) || !nrow(flags)) return(NULL)
+  flags %>%
+    mutate(
+      fail_reason = dplyr::case_when(
+        keep ~ "kept",
+        !gfp_pass & !rfp_pass ~ "both fail",
+        !gfp_pass ~ "GFP fail",
+        !rfp_pass ~ "RFP fail",
+        TRUE ~ "unknown"
+      )
+    ) %>%
+    dplyr::filter(fail_reason != "kept") %>%
+    dplyr::count(type, condition, fail_reason) %>%
+    ggplot(aes(x = condition, y = n, fill = fail_reason)) +
+    geom_col(position = "dodge") +
+    facet_wrap(~ type, scales = "free_y") +
+    theme_bw() +
+    labs(
+      title = "TOY — Why nuclei were excluded",
+      x = "Condition", y = "Count", fill = "Reason"
+    )
+}
+
+make_plot_area_hist <- function(flags) {
+  if (!exists("all_flags") || !is.data.frame(flags) || !nrow(flags)) return(NULL)
+  ggplot(flags, aes(GFP_area)) +
+    geom_histogram(bins = 30, color = "black", fill = "steelblue") +
+    facet_grid(type ~ condition) +
+    geom_vline(xintercept = 20, color = "red", linetype = "dashed") +
+    theme_bw() +
+    labs(
+      title = "TOY — Area distribution by condition/type",
+      x = "GFP_area", y = "Count"
+    )
+}
+
+make_plot_circ_hist <- function(flags) {
+  if (!exists("all_flags") || !is.data.frame(flags) || !nrow(flags)) return(NULL)
+  ggplot(flags, aes(GFP_circ)) +
+    geom_histogram(bins = 30, color = "black", fill = "darkgreen") +
+    facet_grid(type ~ condition) +
+    geom_vline(xintercept = 0.80, color = "red", linetype = "dashed") +
+    theme_bw() +
+    labs(
+      title = "TOY — Circularity distribution by condition/type",
+      x = "GFP_circ", y = "Count"
+    )
+}
+```
+

@@ -1,0 +1,478 @@
+---
+title: 'LC–MS Quantification: Normalization & Reporting'
+author: "Jude Akkad"
+date: "2025-09-09"
+output: html_document
+---
+```{r}
+# =========================
+# 0) PACKAGES & SEED
+# =========================
+pkgs <- c(
+  "tibble","dplyr","tidyr","purrr","readr","stringr","forcats",
+  "ggplot2","scales","broom","fs","glue","knitr","kableExtra"
+)
+to_install <- pkgs[!pkgs %in% installed.packages()[,"Package"]]
+if (length(to_install)) install.packages(to_install, quiet = TRUE)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+set.seed(1234)
+
+```
+
+```{r}
+# =========================
+# 1) SIMULATE LC–MS DATA
+# =========================
+simulate_lcms <- function(
+  analytes             = c("A","B","C"),
+  n_batches            = 3,
+  n_unknowns_per_batch = 12,
+  calib_levels_n       = 7,          # number of nonzero calibration levels (plus a 0)
+  qc_levels            = c(5, 50),   # ng/mL targets for QCs
+  is_response_cv       = 0.08,       # CV for internal standard area
+  tic_cv               = 0.10,       # CV for total ion current scaling
+  slope_mean           = c(A=12000, B=8000, C=15000),  # signal per ng/mL
+  slope_sd_frac        = 0.10,       # between-batch slope variation
+  intercept_mean       = 3000,       # baseline noise
+  intercept_sd         = 800,        # baseline noise variation
+  measurement_cv       = 0.10,       # peak area CV around mean
+  is_nominal_ng_mL     = 100         # spiked IS conc (for reporting)
+){
+  # Calibration concentrations (include 0)
+  calib_conc <- c(0, signif(exp(seq(log(0.5), log(500), length.out = calib_levels_n)), 2))
+
+  batches <- tibble(batch = paste0("B", seq_len(n_batches)))
+
+  # Per-batch × analyte calibration parameters (use explicit names)
+  calib_params <- batches |>
+    tidyr::expand(batch, analyte = analytes) |>
+    dplyr::mutate(
+      slope_base     = unname(slope_mean[analyte]),
+      slope_base     = ifelse(is.na(slope_base), mean(slope_mean), slope_base),
+      slope_cal      = pmax(1, slope_base * rnorm(dplyr::n(), mean = 1, sd = slope_sd_frac)),
+      intercept_cal  = pmax(0, rnorm(dplyr::n(), intercept_mean, intercept_sd))
+    ) |>
+    dplyr::select(batch, analyte, slope_cal, intercept_cal)
+
+  # Helper: simulate signal with CV
+  sim_signal <- function(conc, slope, intercept, cv){
+    mu  <- intercept + slope * conc
+    eps <- rnorm(length(mu), mean = 0, sd = cv)
+    pmax(0, mu * (1 + eps))
+  }
+
+  # CAL rows (incl. blanks)
+  df_cal <- calib_params |>
+    tidyr::uncount(length(calib_conc), .id = "level_id") |>
+    dplyr::mutate(
+      sample_type = "CAL",
+      conc_ng_mL  = rep(calib_conc, times = n_batches * length(analytes)),
+      cal_id      = paste0("CAL_", readr::parse_number(batch), "_", analyte, "_", level_id)
+    )
+
+  # QC rows (two replicates per level)
+  df_qc <- calib_params |>
+    tidyr::uncount(length(qc_levels) * 2, .id = "qc_rep") |>
+    dplyr::mutate(
+      sample_type = "QC",
+      conc_ng_mL  = rep(qc_levels, each = 2) |> rep(times = n_batches * length(analytes)),
+      cal_id      = NA_character_
+    )
+
+  # UNK rows (random true concentrations)
+  df_unk <- calib_params |>
+    tidyr::uncount(n_unknowns_per_batch, .id = "unk_id") |>
+    dplyr::mutate(
+      sample_type = "UNK",
+      conc_ng_mL  = exp(runif(dplyr::n(), log(0.8), log(400))),
+      cal_id      = NA_character_
+    )
+
+  # Combine into a "run order" table (toy)
+  raw <- dplyr::bind_rows(df_cal, df_qc, df_unk) |>
+    dplyr::arrange(
+      batch, sample_type,
+      dplyr::if_else(sample_type=="CAL", conc_ng_mL, as.numeric(NA)),
+      analyte
+    )
+
+  # Simulate run-level covariates (per injection)
+  raw <- raw |>
+    dplyr::group_by(batch) |>
+    dplyr::mutate(
+      tic_factor = pmax(0.6, rnorm(dplyr::n(), 1, tic_cv)),
+      is_area    = sim_signal(is_nominal_ng_mL, slope = 9000, intercept = 1500, cv = is_response_cv) * tic_factor
+    ) |>
+    dplyr::ungroup()
+
+  # Directly use carried calibration params to simulate analyte peak area
+  raw <- raw |>
+    dplyr::mutate(
+      analyte_area = sim_signal(conc_ng_mL, slope_cal, intercept_cal, measurement_cv) * tic_factor
+    )
+
+  # Final run table (drop cal params from outputs)
+  run_table <- raw |>
+    dplyr::transmute(
+      batch, sample_type, analyte,
+      sample_id = dplyr::coalesce(cal_id,
+        paste0(sample_type, "_", batch, "_", analyte, "_", dplyr::row_number())),
+      conc_ng_mL_true = conc_ng_mL,
+      is_area, tic_factor, analyte_area,
+      is_nominal_ng_mL = is_nominal_ng_mL
+    )
+
+  # Meta (simple per-analyte × batch LLOQ/ULOQ)
+  meta <- tibble(
+    analyte = rep(analytes, each = n_batches),
+    batch   = rep(batches$batch, times = length(analytes)),
+    lloq_ng_mL = min(calib_conc[calib_conc > 0]),
+    uloq_ng_mL = max(calib_conc)
+  )
+
+  list(run_table = run_table, meta = meta)
+}
+
+# Run the simulator
+sim <- simulate_lcms()
+
+```
+
+```{r}
+# =========================
+# 2) WRITE CSVs
+# =========================
+# Choose output directory (handle Github/Gitub spelling)
+dir1 <- "~/Desktop/Github/Molecular Farming/sample_data"
+dir2 <- "~/Desktop/Gitub/Molecular Farming/sample_data"
+outdir <- if (dir.exists(path.expand(dir1))) dir1 else dir2
+dir.create(path.expand(outdir), recursive = TRUE, showWarnings = FALSE)
+
+readr::write_csv(sim$run_table, file.path(path.expand(outdir), "sample_data_lcms_demo.csv"))
+readr::write_csv(sim$meta,      file.path(path.expand(outdir), "sample_data_lcms_meta_demo.csv"))
+
+message("Wrote: ", file.path(path.expand(outdir), "sample_data_lcms_demo.csv"))
+message("Wrote: ", file.path(path.expand(outdir), "sample_data_lcms_meta_demo.csv"))
+
+```
+```{r}
+# =========================
+# 3) SETUP + PATHS (drop-in)
+# =========================
+pkgs <- c("tidyverse","readr","fs","glue","scales","knitr","kableExtra","broom")
+to_install <- pkgs[!pkgs %in% installed.packages()[,"Package"]]
+if (length(to_install)) install.packages(to_install, quiet = TRUE)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+`%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
+if (!exists("params")) params <- list()
+
+default_data_dir <- if (dir.exists(path.expand("~/Desktop/Github/Molecular Farming/sample_data"))) {
+  "~/Desktop/Github/Molecular Farming/sample_data"
+} else {
+  "~/Desktop/Gitub/Molecular Farming/sample_data"
+}
+
+data_dir <- params$data_dir %||% default_data_dir
+data_dir <- fs::path_expand(data_dir)
+if (!dir.exists(data_dir)) stop("Data directory not found: ", data_dir)
+
+input_run_name  <- params$input_run  %||% "sample_data_lcms_demo.csv"
+input_meta_name <- params$input_meta %||% "sample_data_lcms_meta_demo.csv"
+
+run_fp  <- file.path(data_dir, input_run_name)
+meta_fp <- file.path(data_dir, input_meta_name)
+
+if (!file.exists(run_fp))  stop("Missing file: ", run_fp)
+if (!file.exists(meta_fp)) stop("Missing file: ", meta_fp)
+
+project_dir <- fs::path_norm(fs::path(data_dir, ".."))
+save_dir    <- fs::path_norm(fs::path(project_dir, "outputs/lcms"))
+fs::dir_create(save_dir, recurse = TRUE)
+
+message("Data dir: ", data_dir)
+message("Using: ", basename(run_fp), " and ", basename(meta_fp))
+message("Outputs -> ", save_dir)
+
+theme_set(ggplot2::theme_minimal(base_size = 12))
+
+```
+
+```{r}
+# =========================
+# 4) READ & PREVIEW
+# =========================
+run_tbl  <- readr::read_csv(run_fp,  show_col_types = FALSE)
+meta_tbl <- readr::read_csv(meta_fp, show_col_types = FALSE)
+
+req_cols <- c("batch","sample_type","analyte","sample_id","conc_ng_mL_true",
+              "is_area","tic_factor","analyte_area","is_nominal_ng_mL")
+missing  <- setdiff(req_cols, names(run_tbl))
+if (length(missing)) stop("Missing columns in run table: ", paste(missing, collapse = ", "))
+
+knitr::kable(head(run_tbl, 12), caption = "Preview of LC–MS injections") |>
+  kableExtra::kable_styling()
+
+```
+
+```{r}
+# =========================
+# 5) NORMALIZATION
+# =========================
+# (1) IS-normalized response, (2) additional TIC normalization
+norm_tbl <- run_tbl |>
+  dplyr::mutate(
+    response_raw      = analyte_area / pmax(is_area, 1e-6),
+    response_tic_norm = response_raw  / pmax(tic_factor, 1e-6)
+  )
+
+knitr::kable(head(norm_tbl, 10), caption = "Normalized responses") |>
+  kableExtra::kable_styling()
+
+```
+```{r}
+# =========================
+# 6) CALIBRATION (per batch × analyte) — FIXED
+# =========================
+cal_data <- norm_tbl |>
+  dplyr::filter(sample_type == "CAL") |>
+  dplyr::rename(conc = conc_ng_mL_true, y = response_tic_norm)
+
+# keep only groups with at least 2 non-zero points
+cal_groups <- cal_data |>
+  dplyr::group_by(batch, analyte) |>
+  dplyr::filter(sum(conc > 0, na.rm = TRUE) >= 2) |>
+  dplyr::group_by(batch, analyte) |>
+  tidyr::nest()
+
+cal_models <- cal_groups |>
+  dplyr::mutate(
+    fit = purrr::map(data, ~{
+      df <- dplyr::filter(.x, conc > 0)
+      stats::lm(y ~ conc, data = df, weights = 1/df$conc)
+    }),
+    tidy   = purrr::map(fit, broom::tidy),
+    glance = purrr::map(fit, broom::glance)
+  )
+
+cal_summ <- cal_models |>
+  dplyr::mutate(
+    slope     = purrr::map_dbl(tidy,   ~ .x$estimate[.x$term == "conc"]),
+    intercept = purrr::map_dbl(tidy,   ~ if ("(Intercept)" %in% .x$term) .x$estimate[.x$term=="(Intercept)"] else 0),
+    r_squared = purrr::map_dbl(glance, ~ .x$r.squared %||% NA_real_)
+  ) |>
+  dplyr::select(batch, analyte, slope, intercept, r_squared) |>
+  dplyr::arrange(batch, analyte)
+
+knitr::kable(cal_summ, digits = 4, caption = "Calibration fits (weighted LS)") |>
+  kableExtra::kable_styling()
+
+```
+```{r}
+# =========================
+# 7) QUANTIFY (back-calc conc)
+# =========================
+predict_conc <- function(y, slope, intercept){
+  conc_hat <- (y - intercept) / pmax(slope, 1e-9)
+  pmax(conc_hat, 0)
+}
+
+# Bring in LLOQ / ULOQ from meta
+limits <- meta_tbl |>
+  dplyr::select(analyte, batch, lloq_ng_mL, uloq_ng_mL)
+
+quant_tbl <- norm_tbl |>
+  dplyr::left_join(cal_summ, by = c("batch","analyte")) |>
+  dplyr::mutate(
+    conc_ng_mL_calc = predict_conc(response_tic_norm, slope, intercept)
+  ) |>
+  dplyr::left_join(limits, by = c("batch","analyte")) |>
+  dplyr::mutate(
+    in_range = conc_ng_mL_calc >= lloq_ng_mL & conc_ng_mL_calc <= uloq_ng_mL
+  )
+
+knitr::kable(
+  head(dplyr::arrange(quant_tbl, sample_type, analyte), 12),
+  caption="Quantified samples (head)"
+) |>
+  kableExtra::kable_styling()
+
+```
+```{r}
+# =========================
+# 8) QC EVALUATION (toy criteria)
+# =========================
+qc_eval <- quant_tbl |>
+  dplyr::filter(sample_type == "QC") |>
+  dplyr::mutate(
+    bias_pct = 100 * (conc_ng_mL_calc - conc_ng_mL_true) / pmax(conc_ng_mL_true, 1e-9)
+  ) |>
+  dplyr::group_by(batch, analyte, conc_ng_mL_true) |>
+  dplyr::summarise(
+    n            = dplyr::n(),
+    mean_ngmL    = mean(conc_ng_mL_calc, na.rm = TRUE),
+    sd_ngmL      = sd(conc_ng_mL_calc, na.rm = TRUE),
+    cv_pct       = 100 * sd_ngmL / pmax(mean_ngmL, 1e-9),
+    mean_bias_pct= mean(bias_pct, na.rm = TRUE),
+    pass_bias    = abs(mean_bias_pct) <= 20,  # toy ±20% acceptance
+    pass_cv      = cv_pct <= 20,              # toy ≤20% acceptance
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(batch, analyte, conc_ng_mL_true)
+
+knitr::kable(qc_eval, digits = 2, caption = "QC summary (±20% bias/CV acceptance)") |>
+  kableExtra::kable_styling()
+
+```
+```{r}
+# =========================
+# 9) PLOTS
+# =========================
+
+# 9a) Calibration curves
+cal_plot_df <- norm_tbl |>
+  dplyr::filter(sample_type=="CAL", conc_ng_mL_true>0) |>
+  dplyr::rename(conc = conc_ng_mL_true, y = response_tic_norm) |>
+  dplyr::left_join(cal_summ, by = c("batch","analyte")) |>
+  dplyr::mutate(y_fit = slope*conc + intercept)
+
+p_cal <- cal_plot_df |>
+  ggplot2::ggplot(ggplot2::aes(conc, y)) +
+  ggplot2::geom_point(alpha = 0.7) +
+  ggplot2::geom_line(ggplot2::aes(y = y_fit), linewidth = 0.7) +
+  ggplot2::scale_x_log10(labels = scales::label_number()) +
+  ggplot2::facet_grid(batch ~ analyte, scales = "free_y") +
+  ggplot2::labs(title = "Calibration curves (per batch × analyte)",
+                x = "Concentration (ng/mL, log10)",
+                y = "Normalized response")
+
+p_cal
+
+# 9b) Calibration residuals
+cal_back <- cal_plot_df |>
+  dplyr::mutate(
+    conc_hat = (y - intercept) / pmax(slope, 1e-9),
+    resid    = conc_hat - conc
+  )
+
+p_resid <- cal_back |>
+  ggplot2::ggplot(ggplot2::aes(conc, resid)) +
+  ggplot2::geom_hline(yintercept = 0, linetype = 2) +
+  ggplot2::geom_point(alpha = 0.7) +
+  ggplot2::scale_x_log10(labels = scales::label_number()) +
+  ggplot2::facet_grid(batch ~ analyte, scales = "free_y") +
+  ggplot2::labs(title = "Calibration residuals",
+                x = "Concentration (ng/mL, log10)",
+                y = "Residual (calc − true, ng/mL)")
+
+p_resid
+
+# 9c) QC bias plot
+p_qc <- quant_tbl |>
+  dplyr::filter(sample_type=="QC") |>
+  dplyr::mutate(
+    bias_pct = 100 * (conc_ng_mL_calc - conc_ng_mL_true) / pmax(conc_ng_mL_true, 1e-9)
+  ) |>
+  ggplot2::ggplot(ggplot2::aes(factor(conc_ng_mL_true), bias_pct)) +
+  ggplot2::geom_hline(yintercept = c(-20,0,20), linetype = c(2,1,2)) +
+  ggplot2::geom_boxplot(outlier.alpha = 0.4) +
+  ggplot2::facet_grid(batch ~ analyte) +
+  ggplot2::labs(title = "QC bias by level",
+                x = "QC target (ng/mL)",
+                y = "Bias (%)")
+
+```
+```{r}
+# 9c) QC bias plot — FIXED
+p_qc <- quant_tbl |>
+  dplyr::filter(sample_type=="QC") |>
+  dplyr::mutate(
+    bias_pct = 100 * (conc_ng_mL_calc - conc_ng_mL_true) / pmax(conc_ng_mL_true, 1e-9)
+  ) |>
+  ggplot2::ggplot(ggplot2::aes(factor(conc_ng_mL_true), bias_pct)) +
+  ggplot2::geom_hline(yintercept = 0,  linetype = 1) +
+  ggplot2::geom_hline(yintercept = -20, linetype = 2) +
+  ggplot2::geom_hline(yintercept = 20,  linetype = 2) +
+  ggplot2::geom_boxplot(outlier.alpha = 0.4) +
+  ggplot2::facet_grid(batch ~ analyte) +
+  ggplot2::labs(
+    title = "QC bias by level",
+    x = "QC target (ng/mL)", y = "Bias (%)"
+  )
+
+p_qc
+
+```
+
+```{r}
+qc_lines <- tibble::tibble(
+  yintercept = c(-20, 0, 20),
+  kind = factor(c("Limit", "Zero", "Limit"), levels = c("Zero","Limit"))
+)
+
+p_qc <- quant_tbl |>
+  dplyr::filter(sample_type=="QC") |>
+  dplyr::mutate(
+    bias_pct = 100 * (conc_ng_mL_calc - conc_ng_mL_true) / pmax(conc_ng_mL_true, 1e-9)
+  ) |>
+  ggplot2::ggplot(ggplot2::aes(factor(conc_ng_mL_true), bias_pct)) +
+  ggplot2::geom_hline(data = qc_lines,
+                      ggplot2::aes(yintercept = yintercept, linetype = kind),
+                      inherit.aes = FALSE) +
+  ggplot2::geom_boxplot(outlier.alpha = 0.4) +
+  ggplot2::facet_grid(batch ~ analyte) +
+  ggplot2::scale_linetype_manual(values = c(Zero = 1, Limit = 2), name = NULL) +
+  ggplot2::labs(
+    title = "QC bias by level",
+    x = "QC target (ng/mL)", y = "Bias (%)"
+  )
+
+p_qc
+
+```
+```{r}
+# 9d) Unknowns distribution
+p_unk <- quant_tbl |>
+  dplyr::filter(sample_type=="UNK") |>
+  ggplot2::ggplot(ggplot2::aes(conc_ng_mL_calc)) +
+  ggplot2::geom_histogram(bins = 25) +
+  ggplot2::facet_grid(batch ~ analyte, scales = "free_x") +
+  ggplot2::labs(
+    title = "Unknown sample concentrations (back-calculated)",
+    x = "Conc (ng/mL)", y = "Count"
+  )
+
+p_unk
+
+```
+
+```{r}
+# =========================
+# 10) EXPORTS
+# =========================
+readr::write_csv(cal_summ,   fs::path(save_dir, "lcms_calibration_summary.csv"))
+readr::write_csv(norm_tbl,   fs::path(save_dir, "lcms_normalized_table.csv"))
+readr::write_csv(quant_tbl,  fs::path(save_dir, "lcms_quantified_table.csv"))
+readr::write_csv(qc_eval,    fs::path(save_dir, "lcms_qc_summary.csv"))
+
+ggplot2::ggsave(fs::path(save_dir, "plot_calibration_curves.png"),    p_cal,   width = 9, height = 6, dpi = 300)
+ggplot2::ggsave(fs::path(save_dir, "plot_calibration_residuals.png"), p_resid, width = 9, height = 6, dpi = 300)
+ggplot2::ggsave(fs::path(save_dir, "plot_qc_bias.png"),               p_qc,    width = 9, height = 6, dpi = 300)
+ggplot2::ggsave(fs::path(save_dir, "plot_unknowns_hist.png"),         p_unk,   width = 9, height = 6, dpi = 300)
+
+cat(glue::glue("
+**Files written to** `{save_dir}`
+
+- lcms_calibration_summary.csv
+- lcms_normalized_table.csv
+- lcms_quantified_table.csv
+- lcms_qc_summary.csv
+- plot_calibration_curves.png
+- plot_calibration_residuals.png
+- plot_qc_bias.png
+- plot_unknowns_hist.png
+"))
+
+```
+

@@ -1,0 +1,302 @@
+---
+title: 'Protein Purification: Yield & Mass Balance'
+author: "Jude Akkad"
+date: "2025-09-09"
+output: html_document
+---
+```{r}
+# Packages
+pkgs <- c("tibble","dplyr","tidyr","readr","stringr")
+to_install <- pkgs[!pkgs %in% installed.packages()[,"Package"]]
+if (length(to_install)) install.packages(to_install, quiet = TRUE)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+set.seed(1234)
+
+simulate_purification <- function(
+  n_batches = 4,
+  steps = c("Harvest","Clarification","Affinity Capture","Buffer Exchange","Polishing"),
+  start_mass_mg_mean = 120.0,
+  start_mass_mg_sd   = 20.0,
+  step_yield_means   = c(0.95, 0.80, 0.85, 0.95, 0.90),
+  step_yield_sds     = c(0.02, 0.05, 0.04, 0.02, 0.03),
+  start_volume_ml_mean = 500,
+  start_volume_ml_sd   = 60
+) {
+  n_steps <- length(steps)
+  if (length(step_yield_means) != n_steps) stop("step_yield_means must match steps length")
+  if (length(step_yield_sds)   != n_steps) stop("step_yield_sds must match steps length")
+
+  batches <- tibble(batch_id = paste0("B", seq_len(n_batches)))
+
+  out <- purrr::map_dfr(batches$batch_id, function(bid) {
+    start_mass <- max(1e-3, rnorm(1, start_mass_mg_mean, start_mass_mg_sd))
+    start_vol  <- max(1,     rnorm(1, start_volume_ml_mean, start_volume_ml_sd))
+
+    # per-step yields (bounded 0..1)
+    yields <- pmin(0.995, pmax(0.05, rnorm(n_steps, step_yield_means, step_yield_sds)))
+
+    # per-step volumes (simulate concentration through process)
+    vol_factors <- c(1.00, 0.90, 0.25, 1.00, 0.80) # relative to previous step
+    if (length(vol_factors) != n_steps) vol_factors <- rep(0.9, n_steps)
+
+    step_df <- tibble(step_index = seq_len(n_steps), step = steps) |>
+      dplyr::mutate(
+        step_yield_frac = yields,
+        volume_ml = cumprod(c(start_vol, vol_factors))[2:(n_steps+1)]
+      )
+
+    # propagate mass through steps
+    step_df <- step_df |>
+      dplyr::mutate(
+        input_mass_mg  = dplyr::if_else(step_index == 1, start_mass,
+                               dplyr::lag(cumprod(dplyr::lag(step_yield_frac, default = 1)) * start_mass)),
+        input_mass_mg  = ifelse(is.na(input_mass_mg), start_mass, input_mass_mg),
+        output_mass_mg = input_mass_mg * step_yield_frac,
+        loss_mg        = pmax(0, input_mass_mg - output_mass_mg),
+        cumulative_yield_frac = output_mass_mg / start_mass,
+        concentration_mg_ml = output_mass_mg / volume_ml
+      ) |>
+      dplyr::mutate(
+        step_yield_pct       = 100 * step_yield_frac,
+        cumulative_yield_pct = 100 * cumulative_yield_frac
+      ) |>
+      dplyr::select(step_index, step, volume_ml, input_mass_mg, output_mass_mg, loss_mg,
+                    step_yield_pct, cumulative_yield_pct, concentration_mg_ml) |>
+      dplyr::mutate(batch_id = bid, .before = 1)
+  })
+
+  out_long <- out |>
+    dplyr::mutate(
+      volume_ml            = round(volume_ml, 2),
+      input_mass_mg        = round(input_mass_mg, 2),
+      output_mass_mg       = round(output_mass_mg, 2),
+      loss_mg              = round(loss_mg, 2),
+      step_yield_pct       = round(step_yield_pct, 1),
+      cumulative_yield_pct = round(cumulative_yield_pct, 1),
+      concentration_mg_ml  = round(concentration_mg_ml, 3)
+    )
+
+  summary_per_batch <- out_long |>
+    dplyr::group_by(batch_id) |>
+    dplyr::slice_max(step_index, n = 1, with_ties = FALSE) |>
+    dplyr::transmute(
+      batch_id,
+      final_mass_mg = output_mass_mg,
+      final_volume_ml = volume_ml,
+      final_concentration_mg_ml = concentration_mg_ml,
+      cumulative_yield_pct
+    ) |>
+    dplyr::ungroup()
+
+  list(long = out_long, summary = summary_per_batch)
+}
+
+sim <- simulate_purification(
+  n_batches = 5,
+  steps = c("Harvest","Clarification","Affinity Capture","Buffer Exchange","Polishing")
+)
+
+# Choose output directory (handle GitHub/Gitub spelling)
+dir1 <- "~/Desktop/Github/Molecular Farming/sample_data"
+dir2 <- "~/Desktop/Gitub/Molecular Farming/sample_data"
+outdir <- if (dir.exists(path.expand(dir1))) dir1 else dir2
+dir.create(path.expand(outdir), recursive = TRUE, showWarnings = FALSE)
+
+write_csv(sim$long,    file.path(path.expand(outdir), "sample_data_purification_demo.csv"))
+write_csv(sim$summary, file.path(path.expand(outdir), "sample_data_purification_summary_demo.csv"))
+
+message("Wrote: ", file.path(path.expand(outdir), "sample_data_purification_demo.csv"))
+message("Wrote: ", file.path(path.expand(outdir), "sample_data_purification_summary_demo.csv"))
+
+```
+
+```{r}
+# ==== SETUP + PATHS (drop-in replacement) ====
+
+# Packages for analysis/IO/plots
+pkgs <- c("tidyverse","readr","fs","glue","scales","knitr","kableExtra")
+to_install <- pkgs[!pkgs %in% installed.packages()[,"Package"]]
+if (length(to_install)) install.packages(to_install, quiet = TRUE)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# Safe default /coalesce helper defined BEFORE use
+`%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
+
+# If knitting without params, provide fallbacks
+if (!exists("params")) params <- list()
+
+# Resolve data_dir (prefer Github spelling, fall back to Gitub)
+default_data_dir <- if (dir.exists(path.expand("~/Desktop/Github/Molecular Farming/sample_data"))) {
+  "~/Desktop/Github/Molecular Farming/sample_data"
+} else {
+  "~/Desktop/Gitub/Molecular Farming/sample_data"
+}
+
+data_dir <- params$data_dir %||% default_data_dir
+data_dir <- fs::path_expand(data_dir)
+
+if (!dir.exists(data_dir)) {
+  stop("Data directory not found: ", data_dir)
+}
+
+# File names (defaults match what your generator wrote)
+input_long_name    <- params$input_long    %||% "sample_data_purification_demo.csv"
+input_summary_name <- params$input_summary %||% "sample_data_purification_summary_demo.csv"
+
+# Build absolute file paths
+long_fp    <- file.path(data_dir, input_long_name)
+summary_fp <- file.path(data_dir, input_summary_name)
+
+# Validate files exist
+if (!file.exists(long_fp))    stop("Missing file: ", long_fp)
+if (!file.exists(summary_fp)) stop("Missing file: ", summary_fp)
+
+# Output folder inside the project
+project_dir <- fs::path_norm(fs::path(data_dir, ".."))
+save_dir    <- fs::path_norm(fs::path(project_dir, "outputs/purification"))
+fs::dir_create(save_dir, recurse = TRUE)
+
+message("Data dir: ", data_dir)
+message("Using: ", basename(long_fp), " and ", basename(summary_fp))
+message("Outputs -> ", save_dir)
+
+theme_set(ggplot2::theme_minimal(base_size = 12))
+
+```
+```{r}
+# ---- READ & SANITY-CHECK ----
+pur_long <- readr::read_csv(long_fp, show_col_types = FALSE)
+pur_sum  <- readr::read_csv(summary_fp, show_col_types = FALSE)
+
+required_cols <- c(
+  "batch_id","step_index","step","volume_ml","input_mass_mg",
+  "output_mass_mg","loss_mg","step_yield_pct","cumulative_yield_pct","concentration_mg_ml"
+)
+missing <- setdiff(required_cols, names(pur_long))
+if (length(missing)) stop("Missing columns in long file: ", paste(missing, collapse = ", "))
+
+knitr::kable(head(pur_long, 10), caption = "Preview of purification steps (long)")
+
+```
+```{r}
+# ---- RECOMPUTE KEY METRICS (VERIFY) ----
+pur_long_chk <- pur_long |>
+  dplyr::arrange(batch_id, step_index) |>
+  dplyr::group_by(batch_id) |>
+  dplyr::mutate(
+    start_mass_mg = dplyr::first(input_mass_mg),
+    step_yield_frac_calc = output_mass_mg / input_mass_mg,
+    cumulative_yield_frac_calc = output_mass_mg / start_mass_mg,
+    step_yield_pct_calc = 100 * step_yield_frac_calc,
+    cumulative_yield_pct_calc = 100 * cumulative_yield_frac_calc
+  ) |>
+  dplyr::ungroup()
+
+diffs <- pur_long_chk |>
+  dplyr::transmute(
+    batch_id, step_index, step,
+    diff_step_yield = step_yield_pct_calc - step_yield_pct,
+    diff_cum_yield  = cumulative_yield_pct_calc - cumulative_yield_pct
+  )
+
+knitr::kable(head(diffs, 10), caption = "Sanity diffs (computed vs provided)")
+
+```
+
+
+```{r}
+# ---- PER-BATCH SUMMARY ----
+per_batch <- pur_long |>
+  dplyr::group_by(batch_id) |>
+  dplyr::summarise(
+    start_mass_mg              = dplyr::first(input_mass_mg),
+    final_mass_mg              = dplyr::last(output_mass_mg),
+    final_volume_ml            = dplyr::last(volume_ml),
+    final_concentration_mg_ml  = dplyr::last(concentration_mg_ml),
+    overall_yield_pct          = dplyr::last(cumulative_yield_pct),
+    n_steps                    = dplyr::n(),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(batch_id)
+
+knitr::kable(per_batch, caption = "Per-batch summary") |> kableExtra::kable_styling()
+
+```
+```{r}
+# ---- MASS BALANCE CHECKS ----
+mass_balance <- pur_long |>
+  dplyr::mutate(check = input_mass_mg - output_mass_mg - loss_mg) |>
+  dplyr::group_by(batch_id) |>
+  dplyr::summarise(
+    max_abs_mass_err_mg  = max(abs(check), na.rm = TRUE),
+    mean_abs_mass_err_mg = mean(abs(check), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+knitr::kable(mass_balance, caption = "Mass balance residuals (should be ~0)") |> kableExtra::kable_styling()
+
+```
+
+```{r}
+# ---- PLOTS: STEP YIELD ----
+p_yield_by_step <- pur_long |>
+  ggplot2::ggplot(ggplot2::aes(x = step_index, y = step_yield_pct, group = batch_id, label = step)) +
+  ggplot2::geom_line(alpha = 0.5) +
+  ggplot2::geom_point() +
+  ggplot2::scale_x_continuous(breaks = unique(pur_long$step_index), labels = unique(pur_long$step)) +
+  ggplot2::labs(title = "Step yield (%) across purification steps", x = "Step", y = "Step yield (%)") +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 40, hjust = 1))
+p_yield_by_step
+
+
+```
+```{r}
+# ---- PLOTS: MASS OVER STEPS ----
+p_mass_over_steps <- pur_long |>
+  tidyr::pivot_longer(c(input_mass_mg, output_mass_mg), names_to = "type", values_to = "mass_mg") |>
+  dplyr::mutate(type = dplyr::recode(type, input_mass_mg = "Input mass", output_mass_mg = "Output mass")) |>
+  ggplot2::ggplot(ggplot2::aes(step_index, mass_mg, color = type)) +
+  ggplot2::geom_line() +
+  ggplot2::geom_point() +
+  ggplot2::scale_x_continuous(breaks = unique(pur_long$step_index), labels = unique(pur_long$step)) +
+  ggplot2::labs(title = "Mass progression across steps", x = "Step", y = "Mass (mg)") +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 40, hjust = 1))
+p_mass_over_steps
+
+```
+```{r}
+# ---- PLOTS: CONCENTRATION ----
+p_conc <- pur_long |>
+  ggplot2::ggplot(ggplot2::aes(step_index, concentration_mg_ml)) +
+  ggplot2::geom_line(ggplot2::aes(group = batch_id), alpha = 0.5) +
+  ggplot2::geom_point() +
+  ggplot2::scale_x_continuous(breaks = unique(pur_long$step_index), labels = unique(pur_long$step)) +
+  ggplot2::labs(title = "Concentration (mg/mL) across steps", x = "Step", y = "mg/mL") +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 40, hjust = 1))
+p_conc
+
+```
+```{r}
+# ---- EXPORTS ----
+readr::write_csv(per_batch,    fs::path(save_dir, "purification_per_batch_summary.csv"))
+readr::write_csv(pur_long,     fs::path(save_dir, "purification_long_steps.csv"))
+readr::write_csv(mass_balance, fs::path(save_dir, "purification_mass_balance_checks.csv"))
+
+ggplot2::ggsave(fs::path(save_dir, "plot_step_yield.png"),      p_yield_by_step,   width = 7, height = 5, dpi = 300)
+ggplot2::ggsave(fs::path(save_dir, "plot_mass_over_steps.png"), p_mass_over_steps, width = 7, height = 5, dpi = 300)
+ggplot2::ggsave(fs::path(save_dir, "plot_concentration.png"),   p_conc,            width = 7, height = 5, dpi = 300)
+
+cat(glue::glue("
+**Files written to** `{save_dir}`
+
+- purification_per_batch_summary.csv
+- purification_long_steps.csv
+- purification_mass_balance_checks.csv
+- plot_step_yield.png
+- plot_mass_over_steps.png
+- plot_concentration.png
+"))
+
+```
+
