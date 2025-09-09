@@ -34,7 +34,11 @@ molecular-farming-analysis/
   Track protein yields across each purification step, calculate recovery %, and export reports.  
 
 - **LC–MS quantification**  
-  Template workflows for parsing instrument exports, peak integration, and normalization against internal standards.  
+  Template workflows for parsing instrument exports, peak integration, and normalization against internal standards.
+
+- ** Transfection efficiency analysis (Fiji + R)**
+Process confocal z-stacks, segment nuclei in Fiji, compute per-cell GFP/RFP ratios with QC, then export tidy CSVs and an HTML report; optional R model estimates transformation efficiency and suggests OD design.
+
 
 ### Documentation
 - **Vector design**  
