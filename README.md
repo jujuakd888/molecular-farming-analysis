@@ -42,7 +42,7 @@ molecular-farming-analysis/
 
 
 ##Sample data
-Example input files are included in [`sample_data/`](sample_data/) for quick testing:
+Example input files are included in sample data for quick testing:
 - Demo TIFF images for agroinfiltration analysis  
 - Example gel/Western blot images  
 - Sample ELISA plate reader export (CSV)  
@@ -58,7 +58,7 @@ Example input files are included in [`sample_data/`](sample_data/) for quick tes
 ## Citation
 
 If you use these workflows in research, please cite this repository.  
- See [`CITATION.cff`](CITATION.cff)
+ See Citation 
 
 
 ## License
